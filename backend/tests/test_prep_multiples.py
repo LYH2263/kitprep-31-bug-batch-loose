@@ -181,6 +181,39 @@ def test_save_without_any_run_only_sets_column(ctx):
     assert ctx["db"].scalars(select(PrepRun)).all() == []
 
 
+def test_corrupt_sheet_rolls_back_column_and_stock(ctx):
+    # 在用单快照损坏：重写必然失败 → 倍数栏、结存整场退回写入前，不留半成品
+    c, ids = ctx["client"], ctx["ids"]
+    r = c.post(f"/api/prep/run?order_id={ids['open']}").json()
+    run = ctx["db"].get(PrepRun, r["id"])
+    run.result_json = "{not-json"
+    ctx["db"].commit()
+    stock_before = ctx["db"].get(Ingredient, ids["meat"]).stock_qty
+
+    resp = c.put(f"/api/inventory/{ids['meat']}/multiple", json={"prep_multiple": 5})
+    assert resp.status_code == 500
+
+    ctx["db"].expire_all()
+    ing = ctx["db"].get(Ingredient, ids["meat"])
+    assert ing.prep_multiple is None                    # 栏退回
+    assert ing.stock_qty == stock_before                # 结存退回
+    # 损坏单仍是原样，没被写成半截
+    assert ctx["db"].get(PrepRun, r["id"]).result_json == "{not-json"
+
+
+def test_clear_multiple_clears_shortage_sticky(ctx):
+    c, ids = ctx["client"], ctx["ids"]
+    c.post(f"/api/prep/run?order_id={ids['open']}")
+    c.put(f"/api/inventory/{ids['meat']}/multiple", json={"prep_multiple": 5})
+    short = c.get(f"/api/prep/shortages?order_id={ids['open']}").json()
+    assert any(s["ingredient_id"] == ids["meat"] for s in short["shortages"])  # 5-4=1，缺
+    # 清空倍数：占用回散数 3.3 < 库存 4，缺料贴必须同步撤下
+    c.put(f"/api/inventory/{ids['meat']}/multiple", json={"prep_multiple": None})
+    short = c.get(f"/api/prep/shortages?order_id={ids['open']}").json()
+    assert all(s["ingredient_id"] != ids["meat"] for s in short["shortages"])
+    assert short["stats"]["shortage_count"] == 0
+
+
 def test_run_only_creates_sheet_does_not_change_stock(ctx):
     c, ids = ctx["client"], ctx["ids"]
     stock_before = ctx["db"].get(Ingredient, ids["meat"]).stock_qty

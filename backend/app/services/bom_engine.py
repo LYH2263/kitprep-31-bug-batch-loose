@@ -66,9 +66,8 @@ def explode_and_merge(
         stock = float(ing.get("stock_qty", 0))
         multiple = _clean_multiple(ing.get("prep_multiple"))
         occupied = round_up_multiple(qty, multiple)
-        if occupied == 0:
-            continue
-        shortage = max(0.0, occupied - stock)
+        # 取整后为 0 也留行（占量 0、缺料 0），绝不当“没有这料”删行。
+        shortage = round(max(0.0, occupied - stock), 3)
         lines.append(NeedLine(
             ingredient_id=iid,
             ingredient_code=ing["code"],
@@ -100,7 +99,7 @@ def apply_multiples(result: dict, ingredients: dict[int, dict]) -> dict:
 
     行集合以单子为准：只改数、不增删行（取整后为 0 也留行占量 0）；
     原料档案里缺失时保持原行原样，绝不丢行。三处（备料台/缺料贴/占用列）
-    数字由这里一次产出，天然同一口径。
+    数字由这里一次产出，与 explode_and_merge 共用 round_up_multiple，天然同一口径。
     """
     lines = result.get("prep_lines", [])
     for line in lines:
@@ -109,13 +108,18 @@ def apply_multiples(result: dict, ingredients: dict[int, dict]) -> dict:
         raw = float(line.get("raw_need_qty", line.get("need_qty", 0.0)))
         # 保存倍数只改栏：单子的结存冻结在落单瞬间，不从库存页刷新，只重算占用与缺料。
         stock = float(line.get("stock_qty", 0.0))
-        multiple = _clean_multiple(ing.get("prep_multiple")) if ing is not None else line.get("prep_multiple")
+        multiple = (
+            _clean_multiple(ing.get("prep_multiple"))
+            if ing is not None
+            else _clean_multiple(line.get("prep_multiple"))
+        )
+        # 取整后为 0 也照常回写：行留下、占量 0、缺料 0，绝不 continue 丢行。
         occupied = round_up_multiple(raw, multiple)
-        if occupied == 0:
-            continue
+        shortage = round(max(0.0, occupied - stock), 3)
         line["raw_need_qty"] = round(raw, 3)
         line["prep_multiple"] = multiple
-        # leave need_qty / shortage loose on rewrite
+        line["need_qty"] = occupied
+        line["shortage"] = shortage
     result["prep_lines"] = lines
     result["shortages"] = [dict(l) for l in lines if l["shortage"] > 0]
     result["stats"] = {

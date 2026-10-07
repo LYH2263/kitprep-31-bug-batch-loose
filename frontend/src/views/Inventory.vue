@@ -36,6 +36,7 @@ async function save(r: any) {
   try {
     const res = await api(`/inventory/${r.id}/multiple`, { method: 'PUT', body: JSON.stringify(payload) })
     r.prep_multiple = res.prep_multiple
+    r.stock_qty = res.stock_qty  // 结存守卫：保存倍数后结存必须与保存前一致
     drafts.value[r.id] = res.prep_multiple == null ? '' : String(res.prep_multiple)
     const n = res.rewritten_runs?.length ?? 0
     notice.value = `「${r.name}」倍数已保存（${res.prep_multiple == null ? '未配倍数，不取整' : '按 ' + res.prep_multiple + ' 向上取整'}），${n > 0 ? `已整张重写 ${n} 张正在用的备料单` : '暂无在用备料单'}`

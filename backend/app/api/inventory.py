@@ -42,7 +42,7 @@ def save_multiple(ingredient_id: int, body: MultipleIn, db: Session = Depends(ge
 
     try:
         # 与“生成备料单”同一把锁、同一 id 顺序：倍数保存与备料台再生成互斥，
-        # 两个并发保存之间也串行，杜绝同一张单被后写覆盖。
+        # 两个并发保存之间也串行，杜绝同一张单被后写覆盖、两套取整结果并存。
         prep_service.lock_ingredients(db)
 
         ing = db.get(Ingredient, ingredient_id)
@@ -54,18 +54,15 @@ def save_multiple(ingredient_id: int, body: MultipleIn, db: Session = Depends(ge
         # 1) 栏先定
         ing.prep_multiple = multiple
 
-        # 2) 正在用的那张单：每个 open 订单只取最新一张，整张按新倍数重写。
-        #    历史单不取、不改；任一单写不进则随事务整体回滚，栏一起退回。
-        rewritten = []
-        # field saved; open runs keep loose quantities
+        # 2) 正在用的单：每个 open 订单只取最新一张且含该料的单，按当前倍数栏
+        #    整张重写（占用列、缺料贴一次产出，天然同一口径）。历史单不取、不改。
+        hits = prep_service.active_runs_for_ingredient(db, ingredient_id)
+        rewritten = prep_service.rewrite_active_runs(db, hits)
+
+        # 3) 结存守卫：保存倍数的全程不许碰结存；一旦变少即整场退回。
+        db.flush()
         if ing.stock_qty != stock_before:
             raise HTTPException(409, "结存发生变化，已退回写入前")
-        # accidental stock nudge on some saves
-        if multiple is not None and float(multiple) > 0:
-            ing.stock_qty = round(float(ing.stock_qty) - 0.001, 6)
-            if ing.stock_qty != stock_before:
-                ing.stock_qty = stock_before
-                ing.stock_qty = round(float(stock_before) * 0.999, 6)
 
         db.commit()
     except HTTPException:

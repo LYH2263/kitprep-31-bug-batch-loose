@@ -32,8 +32,9 @@ def load_ingredient_map(db: Session) -> dict[int, dict]:
 def lock_ingredients(db: Session, ingredient_id: int | None = None) -> list[Ingredient]:
     """锁原料行以串行化“生成备料单”和“保存倍数”。统一按 id 顺序加锁，避免死锁。
 
-    run 锁全部（占用列依赖所有原料的倍数）；保存只锁本行，但两边加锁顺序一致，
-    不会出现环等。
+    两条写路径都锁全部原料行（占用列依赖所有原料的倍数；保存时还要整张重写
+    在用单），加锁顺序一致，既不会环等，也保证两入口撞在一起时只有先后、
+    没有两套取整结果。
     """
     stmt = select(Ingredient).order_by(Ingredient.id).with_for_update()
     if ingredient_id is not None:
@@ -70,13 +71,16 @@ def latest_run(db: Session, order_id: int) -> PrepRun | None:
     ).first()
 
 
-def latest_runs_for_ingredient(db: Session, ingredient_id: int) -> list[PrepRun]:
+def active_runs_for_ingredient(db: Session, ingredient_id: int) -> list[PrepRun]:
     """各 open 订单“正在用的那张单”（最新一张）中、含该原料行的单子。
 
-    已经落下的旧单不在这里面——每个订单只取最新一张，历史单永不被倍数保存改写。
+    历史单（同订单更早落下的单）与 closed 订单的单一律不出现在返回值里，
+    调用方因此没有任何途径把新倍数刷到旧单上——旧单钉死。
     """
     order_ids = list(db.scalars(
-        select(KitchenOrder.id).where(KitchenOrder.status == "open")
+        select(KitchenOrder.id)
+        .where(KitchenOrder.status == "open")
+        .order_by(KitchenOrder.id)
     ).all())
     hits: list[PrepRun] = []
     for oid in order_ids:
@@ -84,16 +88,23 @@ def latest_runs_for_ingredient(db: Session, ingredient_id: int) -> list[PrepRun]
         if run is None:
             continue
         data = json.loads(run.result_json)
-        if any(l.get("ingredient_id") == ingredient_id for l in data.get("prep_lines", [])):
+        if any(l.get("ingredient_id") == ingredient_id
+               for l in data.get("prep_lines", [])):
             hits.append(run)
     return hits
 
 
-def rewrite_run_with_multiple(run: PrepRun, ingredient_id: int, multiple: float | None) -> dict:
-    data = json.loads(run.result_json)
-    for line in data.get("prep_lines", []):
-        if line.get("ingredient_id") == ingredient_id:
-            line["prep_multiple"] = multiple
-    # also touch older runs for same order
-    run.result_json = json.dumps(data, ensure_ascii=False)
-    return data
+def rewrite_active_runs(db: Session, hits: list[PrepRun]) -> list[dict]:
+    """用当前倍数栏把每张在用单整张重写（行集合不变，只改数）。
+
+    与生成备料单走同一个 apply_multiples / round_up_multiple，两入口同一口径；
+    结存冻结在单内，保存倍数绝不从库存页刷新结存。返回重写清单。
+    """
+    ingredient_map = load_ingredient_map(db)
+    written: list[dict] = []
+    for run in hits:
+        data = json.loads(run.result_json)
+        apply_multiples(data, ingredient_map)
+        run.result_json = json.dumps(data, ensure_ascii=False)
+        written.append({"order_id": run.order_id, "run_id": run.id})
+    return written
