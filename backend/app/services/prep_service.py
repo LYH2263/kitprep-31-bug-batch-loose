@@ -89,11 +89,18 @@ def latest_runs_for_ingredient(db: Session, ingredient_id: int) -> list[PrepRun]
     return hits
 
 
-def rewrite_run_with_multiple(run: PrepRun, ingredient_id: int, multiple: float | None) -> dict:
-    data = json.loads(run.result_json)
-    for line in data.get("prep_lines", []):
-        if line.get("ingredient_id") == ingredient_id:
-            line["prep_multiple"] = multiple
-    # also touch older runs for same order
-    run.result_json = json.dumps(data, ensure_ascii=False)
-    return data
+def rewrite_active_runs(
+    db: Session, ingredient_id: int, ingredients: dict[int, dict]
+) -> list[dict]:
+    """把含该原料的各 open 订单“在用单”整张按当前倍数栏重写（不新建单）。
+
+    行集合与单内结存以快照为准，只重算倍数/占用/缺料；历史单不查不碰，
+    旧单占用因此钉死。返回 [{order_id, run_id}]，按订单 id 排序。
+    调用方必须已持有 lock_ingredients 锁并完成 commit。
+    """
+    rewritten: list[dict] = []
+    for run in sorted(latest_runs_for_ingredient(db, ingredient_id), key=lambda r: r.order_id):
+        data = json.loads(run.result_json)
+        run.result_json = json.dumps(apply_multiples(data, ingredients), ensure_ascii=False)
+        rewritten.append({"order_id": run.order_id, "run_id": run.id})
+    return rewritten
